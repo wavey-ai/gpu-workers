@@ -1,0 +1,9 @@
+[package]
+name = "gpu-worker-upload-response"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1"
+http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }
+upload-response = { path = "../../web-services/upload-response" }

@@ -1,0 +1,9 @@
+[package]
+name = "gpu-worker-torch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+tch = "0.20.0"
+

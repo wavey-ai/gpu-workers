@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "gpu-worker-core",
+    "gpu-worker-ort",
+    "gpu-worker-torch",
+    "gpu-worker-upload-response",
+]
+resolver = "2"
