@@ -42,9 +42,7 @@ Concretely:
 
 Current first-phase extraction:
 
-- `asr-onnx` uses `gpu-worker-ort` for ORT runtime/session policy
 - `encodec-rs` uses `gpu-worker-ort` for ONNX session construction
-- `asr-torch` uses `gpu-worker-torch` for CUDA module/tensor helpers
 - `gpu-worker-upload-response` provides the first reusable local worker job
   abstraction on top of named intermediate stages
 
