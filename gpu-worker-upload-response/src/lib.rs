@@ -1,9 +1,17 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::Result;
+use async_trait::async_trait;
 use bytes::Bytes;
 use http_pack::stream::{StreamHeaders, StreamRequestHeaders, StreamResponseHeaders};
+use tokio::task::JoinSet;
+use tokio::time::interval;
+use tracing::{error, info};
 use upload_response::{
     ActiveStreamInfo, RequestControl, StageTailSlot, TailSlot, UploadResponseService,
+    WorkerHeartbeatUpdate,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +30,15 @@ pub enum SinkLane {
 pub struct PipelineSpec {
     pub source: SourceLane,
     pub sink: SinkLane,
+}
+
+impl PipelineSpec {
+    pub fn sink_stage_name(&self) -> String {
+        match &self.sink {
+            SinkLane::Stage(stage) => stage.clone(),
+            SinkLane::Response => "response".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +79,10 @@ impl LocalJob {
 
     pub fn worker_id(&self) -> &str {
         &self.worker_id
+    }
+
+    pub fn slot_bytes(&self) -> usize {
+        self.service.config().slot_bytes()
     }
 
     pub async fn tail(&self, slot_id: usize) -> Option<SourceFrame> {
@@ -211,6 +232,166 @@ pub async fn claim_local_job(
             stream.stream_id,
             spec.clone(),
         ));
+    }
+
+    None
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalWorkerConfig {
+    pub worker_id: String,
+    pub heartbeat_stage: String,
+    pub max_inflight: usize,
+    pub poll_interval: Duration,
+    pub heartbeat_interval: Duration,
+    pub spec: PipelineSpec,
+}
+
+impl LocalWorkerConfig {
+    pub fn new(worker_id: impl Into<String>, spec: PipelineSpec) -> Self {
+        let heartbeat_stage = spec.sink_stage_name();
+        Self {
+            worker_id: worker_id.into(),
+            heartbeat_stage,
+            max_inflight: 1,
+            poll_interval: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_secs(1),
+            spec,
+        }
+    }
+
+    fn heartbeat(&self, inflight: usize) -> WorkerHeartbeatUpdate {
+        let inflight = inflight.min(self.max_inflight);
+        WorkerHeartbeatUpdate {
+            stage: self.heartbeat_stage.clone(),
+            max_inflight: self.max_inflight,
+            inflight,
+            available_slots: self.max_inflight.saturating_sub(inflight),
+        }
+    }
+}
+
+#[async_trait]
+pub trait LocalJobProcessor: Send + Sync + 'static {
+    async fn process(&self, job: LocalJob) -> Result<()>;
+}
+
+pub async fn run_local_worker_loop<P>(
+    service: Arc<UploadResponseService>,
+    config: LocalWorkerConfig,
+    processor: Arc<P>,
+) where
+    P: LocalJobProcessor,
+{
+    info!(
+        worker_id = %config.worker_id,
+        heartbeat_stage = %config.heartbeat_stage,
+        max_inflight = config.max_inflight,
+        poll_ms = config.poll_interval.as_millis(),
+        heartbeat_ms = config.heartbeat_interval.as_millis(),
+        source = ?config.spec.source,
+        sink = ?config.spec.sink,
+        "local worker loop started"
+    );
+
+    let mut poll = interval(config.poll_interval.max(Duration::from_millis(1)));
+    let mut heartbeat = interval(config.heartbeat_interval.max(Duration::from_millis(1)));
+    let mut inflight = HashSet::new();
+    let mut tasks = JoinSet::new();
+    let mut send_heartbeat = true;
+
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {}
+            _ = heartbeat.tick() => {
+                send_heartbeat = true;
+            }
+        }
+
+        while let Some(joined) = tasks.try_join_next() {
+            match joined {
+                Ok(stream_id) => {
+                    inflight.remove(&stream_id);
+                    send_heartbeat = true;
+                }
+                Err(join_error) => {
+                    error!(%join_error, "local worker task failed");
+                }
+            }
+        }
+
+        if send_heartbeat {
+            service
+                .upsert_worker_heartbeat(&config.worker_id, config.heartbeat(inflight.len()))
+                .await;
+            send_heartbeat = false;
+        }
+
+        while inflight.len() < config.max_inflight {
+            let Some(job) = claim_next_local_job(Arc::clone(&service), &config, &inflight).await
+            else {
+                break;
+            };
+
+            let _ = service
+                .register_reader(job.stream_id, &config.worker_id)
+                .await;
+
+            inflight.insert(job.stream_id);
+            send_heartbeat = true;
+
+            let processor = Arc::clone(&processor);
+            let service = Arc::clone(&service);
+            let worker_id = config.worker_id.clone();
+            tasks.spawn(async move {
+                let stream_id = job.stream_id;
+                if let Err(error) = processor.process(job.clone()).await {
+                    error!(stream_id, error = %error, "local worker job failed");
+                }
+                let _ = job.release().await;
+                let _ = service.unregister_reader(stream_id, &worker_id).await;
+                stream_id
+            });
+        }
+    }
+}
+
+async fn claim_next_local_job(
+    service: Arc<UploadResponseService>,
+    config: &LocalWorkerConfig,
+    inflight: &HashSet<u64>,
+) -> Option<LocalJob> {
+    for stream in service.active_streams().await {
+        if inflight.contains(&stream.stream_id) {
+            continue;
+        }
+        if !source_ready(&stream, &config.spec.source)
+            || !sink_available(&stream, &config.spec.sink)
+        {
+            continue;
+        }
+
+        let claimed = match &config.spec.sink {
+            SinkLane::Stage(stage) => {
+                service
+                    .try_claim_stage(stream.stream_id, stage, &config.worker_id)
+                    .await
+            }
+            SinkLane::Response => {
+                service
+                    .try_claim_response(stream.stream_id, &config.worker_id)
+                    .await
+            }
+        };
+
+        if claimed {
+            return Some(LocalJob::new(
+                Arc::clone(&service),
+                config.worker_id.clone(),
+                stream.stream_id,
+                config.spec.clone(),
+            ));
+        }
     }
 
     None

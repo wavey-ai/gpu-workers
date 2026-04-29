@@ -20,6 +20,7 @@ live inside model-specific applications such as ASR or EnCodec.
 - `gpu-worker-upload-response`
   - shared adapter over `upload-response`
   - local job abstraction for `request -> stage` and `stage -> response`
+  - reusable local worker loop with claim/inflight/heartbeat handling
   - keeps transport concerns out of model workers
 
 ## Intended Layering
@@ -45,6 +46,7 @@ Current first-phase extraction:
 - `encodec-rs` uses `gpu-worker-ort` for ONNX session construction
 - `gpu-worker-upload-response` provides the first reusable local worker job
   abstraction on top of named intermediate stages
+- `asr-api` local decode worker is now using that shared loop
 
 Still to do:
 

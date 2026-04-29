@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1"
+async-trait = "0.1"
 bytes = "1"
 http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+tracing = "0.1"
 upload-response = { git = "https://github.com/wavey-ai/web-services.git", rev = "b5d4a2ea04181cd98ffebd07cd55d43c4963aea0" }
