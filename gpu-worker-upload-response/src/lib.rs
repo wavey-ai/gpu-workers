@@ -8,7 +8,7 @@ use bytes::Bytes;
 use http::Request;
 use http_pack::stream::{StreamHeaders, StreamRequestHeaders, StreamResponseHeaders};
 use tokio::task::JoinSet;
-use tokio::time::interval;
+use tokio::time::{interval, Interval};
 use tracing::{debug, error, info, warn};
 use upload_response::{
     discover_ingress_origins, request_from_stream_headers, ActiveStreamInfo, RemoteIngressClient,
@@ -85,6 +85,30 @@ impl LocalJob {
 
     pub fn slot_bytes(&self) -> usize {
         self.service.config().slot_bytes()
+    }
+
+    pub async fn source_last(&self) -> Result<usize> {
+        match &self.spec.source {
+            SourceLane::Request => self
+                .service
+                .request_last(self.stream_id)
+                .ok_or_else(|| anyhow::anyhow!("request stream {} disappeared", self.stream_id)),
+            SourceLane::Stage(stage) => self
+                .service
+                .stage_last(self.stream_id, stage)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!("stage {stage} stream {} disappeared", self.stream_id)
+                }),
+        }
+    }
+
+    pub fn source_reader_from(
+        &self,
+        last_slot: usize,
+        poll_interval: Duration,
+    ) -> LocalSourceReader {
+        LocalSourceReader::new(self.clone(), last_slot, poll_interval)
     }
 
     pub async fn request(&self) -> Result<Option<Request<()>>> {
@@ -251,6 +275,27 @@ impl RemoteJob {
         format!("{}#{}", self.origin, self.stream_id)
     }
 
+    pub async fn source_last(&self) -> Result<usize> {
+        match &self.spec.source {
+            SourceLane::Request => Ok(self
+                .client
+                .request_last(&self.origin, self.stream_id)
+                .await?),
+            SourceLane::Stage(stage) => Ok(self
+                .client
+                .stage_last(&self.origin, self.stream_id, stage)
+                .await?),
+        }
+    }
+
+    pub fn source_reader_from(
+        &self,
+        last_slot: usize,
+        poll_interval: Duration,
+    ) -> RemoteSourceReader {
+        RemoteSourceReader::new(self.clone(), last_slot, poll_interval)
+    }
+
     pub async fn request(&self) -> Result<Option<Request<()>>> {
         self.client
             .request_headers(&self.origin, self.stream_id)
@@ -372,6 +417,94 @@ impl RemoteJob {
                     .release_response(&self.origin, self.stream_id, &self.worker_id)
                     .await
             }
+        }
+    }
+}
+
+pub struct LocalSourceReader {
+    job: LocalJob,
+    poll: Interval,
+    next_slot: usize,
+    current_last: usize,
+    finished: bool,
+}
+
+impl LocalSourceReader {
+    fn new(job: LocalJob, last_slot: usize, poll_interval: Duration) -> Self {
+        Self {
+            job,
+            poll: interval(poll_interval.max(Duration::from_millis(1))),
+            next_slot: last_slot + 1,
+            current_last: last_slot,
+            finished: false,
+        }
+    }
+
+    pub async fn next_frame(&mut self) -> Result<Option<SourceFrame>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        loop {
+            if self.next_slot <= self.current_last {
+                let slot_id = self.next_slot;
+                self.next_slot += 1;
+                match self.job.tail(slot_id).await {
+                    Some(SourceFrame::End) => {
+                        self.finished = true;
+                        return Ok(Some(SourceFrame::End));
+                    }
+                    Some(frame) => return Ok(Some(frame)),
+                    None => continue,
+                }
+            }
+
+            self.poll.tick().await;
+            self.current_last = self.job.source_last().await?;
+        }
+    }
+}
+
+pub struct RemoteSourceReader {
+    job: RemoteJob,
+    poll: Interval,
+    next_slot: usize,
+    current_last: usize,
+    finished: bool,
+}
+
+impl RemoteSourceReader {
+    fn new(job: RemoteJob, last_slot: usize, poll_interval: Duration) -> Self {
+        Self {
+            job,
+            poll: interval(poll_interval.max(Duration::from_millis(1))),
+            next_slot: last_slot + 1,
+            current_last: last_slot,
+            finished: false,
+        }
+    }
+
+    pub async fn next_frame(&mut self) -> Result<Option<SourceFrame>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        loop {
+            if self.next_slot <= self.current_last {
+                let slot_id = self.next_slot;
+                self.next_slot += 1;
+                match self.job.tail(slot_id).await? {
+                    Some(SourceFrame::End) => {
+                        self.finished = true;
+                        return Ok(Some(SourceFrame::End));
+                    }
+                    Some(frame) => return Ok(Some(frame)),
+                    None => continue,
+                }
+            }
+
+            self.poll.tick().await;
+            self.current_last = self.job.source_last().await?;
         }
     }
 }
