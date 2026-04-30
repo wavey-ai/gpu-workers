@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
+http = "1"
 http-pack = { git = "https://github.com/wavey-ai/http-pack.git", default-features = false }
 tokio = { version = "1", features = ["rt", "time", "sync"] }
 tracing = "0.1"
