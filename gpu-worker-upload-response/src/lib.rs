@@ -144,8 +144,8 @@ impl LocalJob {
     }
 
     pub async fn request_headers(&self) -> Option<StreamRequestHeaders> {
-        match self.tail(1).await? {
-            SourceFrame::RequestHeaders(headers) => Some(headers),
+        match self.service.tail_request(self.stream_id, 1).await? {
+            TailSlot::Headers(headers) => Some(headers),
             _ => None,
         }
     }
