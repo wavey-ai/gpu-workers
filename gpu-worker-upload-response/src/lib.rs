@@ -6,7 +6,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::Request;
-use http_pack::stream::{StreamHeaders, StreamRequestHeaders, StreamResponseHeaders};
+use http_pack::stream::{
+    decode_frame, StreamFrame, StreamHeaders, StreamRequestHeaders, StreamResponseHeaders,
+};
 use tokio::task::JoinSet;
 use tokio::time::{interval, Interval};
 use tracing::{debug, error, info, warn};
@@ -145,15 +147,38 @@ impl LocalJob {
 
     pub async fn request_headers(&self) -> Option<StreamRequestHeaders> {
         match self.service.tail_request(self.stream_id, 1).await? {
-            TailSlot::Headers(headers) => Some(headers),
+            TailSlot::Headers(headers) => {
+                self.mark_source_slot(1).await;
+                Some(headers)
+            }
             _ => None,
         }
     }
 
     pub async fn stage_head(&self) -> Option<Bytes> {
         match self.tail(1).await? {
-            SourceFrame::StageHead(head) => Some(head),
+            SourceFrame::StageHead(head) => {
+                self.mark_source_slot(1).await;
+                Some(head)
+            }
             _ => None,
+        }
+    }
+
+    pub async fn mark_source_slot(&self, slot_id: usize) {
+        match &self.spec.source {
+            SourceLane::Request => {
+                let _ = self
+                    .service
+                    .mark_request_reader_position(self.stream_id, &self.worker_id, slot_id)
+                    .await;
+            }
+            SourceLane::Stage(stage) => {
+                let _ = self
+                    .service
+                    .mark_stage_reader_position(self.stream_id, stage, &self.worker_id, slot_id)
+                    .await;
+            }
         }
     }
 
@@ -297,9 +322,14 @@ impl RemoteJob {
     }
 
     pub async fn request(&self) -> Result<Option<Request<()>>> {
-        self.client
+        let request = self
+            .client
             .request_headers(&self.origin, self.stream_id)
-            .await
+            .await?;
+        if request.is_some() {
+            self.mark_source_slot(1).await?;
+        }
+        Ok(request)
     }
 
     pub async fn tail(&self, slot_id: usize) -> Result<Option<SourceFrame>> {
@@ -310,7 +340,12 @@ impl RemoteJob {
                     .request_slot(&self.origin, self.stream_id, slot_id)
                     .await?
                 {
-                    Some(RemoteRequestSlot::Headers(_)) => None,
+                    Some(RemoteRequestSlot::Headers(bytes)) => match decode_frame(&bytes)? {
+                        StreamFrame::Headers(StreamHeaders::Request(headers)) => {
+                            Some(SourceFrame::RequestHeaders(headers))
+                        }
+                        _ => None,
+                    },
                     Some(RemoteRequestSlot::Body(body)) => Some(SourceFrame::Body(body)),
                     Some(RemoteRequestSlot::Control(control)) => {
                         Some(SourceFrame::Control(control))
@@ -337,8 +372,37 @@ impl RemoteJob {
 
     pub async fn stage_head(&self) -> Result<Option<Bytes>> {
         match self.tail(1).await? {
-            Some(SourceFrame::StageHead(head)) => Ok(Some(head)),
+            Some(SourceFrame::StageHead(head)) => {
+                self.mark_source_slot(1).await?;
+                Ok(Some(head))
+            }
             _ => Ok(None),
+        }
+    }
+
+    pub async fn mark_source_slot(&self, slot_id: usize) -> Result<()> {
+        match &self.spec.source {
+            SourceLane::Request => {
+                self.client
+                    .mark_request_reader_position(
+                        &self.origin,
+                        self.stream_id,
+                        &self.worker_id,
+                        slot_id,
+                    )
+                    .await
+            }
+            SourceLane::Stage(stage) => {
+                self.client
+                    .mark_stage_reader_position(
+                        &self.origin,
+                        self.stream_id,
+                        stage,
+                        &self.worker_id,
+                        slot_id,
+                    )
+                    .await
+            }
         }
     }
 
@@ -450,11 +514,13 @@ impl LocalSourceReader {
                 let slot_id = self.next_slot;
                 self.next_slot += 1;
                 match self.job.tail(slot_id).await {
-                    Some(SourceFrame::End) => {
-                        self.finished = true;
-                        return Ok(Some(SourceFrame::End));
+                    Some(frame) => {
+                        self.job.mark_source_slot(slot_id).await;
+                        if matches!(frame, SourceFrame::End) {
+                            self.finished = true;
+                        }
+                        return Ok(Some(frame));
                     }
-                    Some(frame) => return Ok(Some(frame)),
                     None => continue,
                 }
             }
@@ -494,11 +560,13 @@ impl RemoteSourceReader {
                 let slot_id = self.next_slot;
                 self.next_slot += 1;
                 match self.job.tail(slot_id).await? {
-                    Some(SourceFrame::End) => {
-                        self.finished = true;
-                        return Ok(Some(SourceFrame::End));
+                    Some(frame) => {
+                        self.job.mark_source_slot(slot_id).await?;
+                        if matches!(frame, SourceFrame::End) {
+                            self.finished = true;
+                        }
+                        return Ok(Some(frame));
                     }
-                    Some(frame) => return Ok(Some(frame)),
                     None => continue,
                 }
             }
@@ -545,7 +613,6 @@ pub async fn claim_local_job(
 
     None
 }
-
 #[derive(Debug, Clone)]
 pub struct LocalWorkerConfig {
     pub worker_id: String,
@@ -687,9 +754,18 @@ pub async fn run_local_worker_loop<P>(
                 break;
             };
 
-            let _ = service
-                .register_reader(job.stream_id, &config.worker_id)
-                .await;
+            match &config.spec.source {
+                SourceLane::Request => {
+                    let _ = service
+                        .register_request_reader(job.stream_id, &config.worker_id)
+                        .await;
+                }
+                SourceLane::Stage(stage) => {
+                    let _ = service
+                        .register_stage_reader(job.stream_id, stage, &config.worker_id)
+                        .await;
+                }
+            }
 
             inflight.insert(job.stream_id);
             send_heartbeat = true;
@@ -803,9 +879,18 @@ pub async fn run_remote_worker_loop<P>(
                 break;
             };
 
-            let _ = client
-                .register_reader(&job.origin, job.stream_id, &config.worker_id)
-                .await;
+            let _ = match &config.spec.source {
+                SourceLane::Request => {
+                    client
+                        .register_request_reader(&job.origin, job.stream_id, &config.worker_id)
+                        .await
+                }
+                SourceLane::Stage(stage) => {
+                    client
+                        .register_stage_reader(&job.origin, job.stream_id, stage, &config.worker_id)
+                        .await
+                }
+            };
 
             let inflight_key = job.inflight_key();
             inflight.insert(inflight_key.clone());
