@@ -10,6 +10,9 @@ live inside model-specific applications such as ASR or EnCodec.
 - `gpu-worker-core`
   - generic job metadata and executor traits
   - no ONNX, Torch, or upload-response assumptions
+- `gpu-worker`
+  - feature-gated facade crate for app services
+  - re-exports the shared core, runtime, and upload-response adapters behind modules
 - `gpu-worker-ort`
   - shared ONNX Runtime bootstrap
   - provider policy for CPU, CUDA, TensorRT, and CoreML
@@ -34,7 +37,7 @@ The intended dependency direction is:
 Concretely:
 
 - `upload-response` owns the generic stream/ring transport
-- `gpu-worker-upload-response` adapts that transport into worker jobs
+- `gpu-worker::upload_response` adapts that transport into worker jobs
 - `gpu-worker-ort` and `gpu-worker-torch` own backend runtime policy
 - app crates such as `asr-onnx`, `asr-torch`, and `encodec-rs` should only
   own model semantics, preprocessing, and postprocessing
@@ -44,9 +47,9 @@ Concretely:
 Current first-phase extraction:
 
 - `encodec-rs` uses `gpu-worker-ort` for ONNX session construction
-- `gpu-worker-upload-response` provides the first reusable local worker job
+- `gpu-worker::upload_response` provides the first reusable local worker job
   abstraction on top of named intermediate stages
-- `asr-api` local decode worker is now using that shared loop
+- `asr-api` uses the facade crate for shared local and remote upload-response worker loops
 
 Still to do:
 

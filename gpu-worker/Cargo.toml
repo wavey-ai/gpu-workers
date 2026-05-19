@@ -1,0 +1,17 @@
+[package]
+name = "gpu-worker"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+core = ["dep:gpu-worker-core"]
+ort = ["dep:gpu-worker-ort"]
+torch = ["dep:gpu-worker-torch"]
+upload-response = ["dep:gpu-worker-upload-response"]
+
+[dependencies]
+gpu-worker-core = { path = "../gpu-worker-core", optional = true }
+gpu-worker-ort = { path = "../gpu-worker-ort", optional = true }
+gpu-worker-torch = { path = "../gpu-worker-torch", optional = true }
+gpu-worker-upload-response = { path = "../gpu-worker-upload-response", optional = true }

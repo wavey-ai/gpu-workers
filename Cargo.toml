@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "gpu-worker",
     "gpu-worker-core",
     "gpu-worker-ort",
     "gpu-worker-torch",
