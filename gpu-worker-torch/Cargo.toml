@@ -2,6 +2,10 @@
 name = "gpu-worker-torch"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "gpu worker for torch"
+repository = "https://github.com/wavey-ai/gpu-workers"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"
