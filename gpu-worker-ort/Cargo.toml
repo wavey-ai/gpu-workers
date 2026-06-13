@@ -2,10 +2,14 @@
 name = "gpu-worker-ort"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "gpu worker for onnx"
+repository = "https://github.com/wavey-ai/gpu-workers"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"
-ort = { git = "https://github.com/pykeio/ort.git", rev = "8724e89ff005ebef4339d7280ff592837404a98d", default-features = false, features = [
+ort = { version = "2.0.0-rc.12", default-features = false, features = [
     "std",
     "ndarray",
     "tracing",
